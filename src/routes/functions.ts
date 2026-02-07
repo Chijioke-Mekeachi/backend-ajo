@@ -37,6 +37,24 @@ async function requireUser(req: ExpressRequest) {
   return { user: data.user, supabaseUser };
 }
 
+function computeNextDebitDateISO(cycleType: string | null | undefined): string {
+  const nextDebitDate = new Date();
+  switch (cycleType) {
+    case "weekly":
+      nextDebitDate.setDate(nextDebitDate.getDate() + 7);
+      break;
+    case "biweekly":
+      nextDebitDate.setDate(nextDebitDate.getDate() + 14);
+      break;
+    case "monthly":
+      nextDebitDate.setMonth(nextDebitDate.getMonth() + 1);
+      break;
+    default:
+      nextDebitDate.setMonth(nextDebitDate.getMonth() + 1);
+  }
+  return nextDebitDate.toISOString();
+}
+
 function jsonError(res: ExpressResponse, status: number, message: string, includeSuccess = true) {
   if (includeSuccess) {
     return res.status(status).json({ success: false, error: message });
@@ -1410,6 +1428,162 @@ export function registerFunctionRoutes(app: Express) {
       });
     } catch (error: any) {
       console.error("Error in charge-contribution:", error);
+      return jsonError(res, 400, error.message ?? "Unknown error");
+    }
+  });
+
+  app.post("/api/pay-contribution-from-wallet", async (req, res) => {
+    try {
+      const { user } = await requireUser(req);
+      const { membership_id, ajo_id } = req.body ?? {};
+
+      if (!membership_id || !ajo_id) {
+        return jsonError(res, 400, "membership_id and ajo_id are required");
+      }
+
+      const supabaseAdmin = createAdminClient();
+
+      const { data: membership, error: membershipError } = await supabaseAdmin
+        .from("memberships")
+        .select("*, ajos(*)")
+        .eq("id", membership_id)
+        .eq("user_id", user.id)
+        .eq("ajo_id", ajo_id)
+        .single();
+
+      if (membershipError || !membership) {
+        return jsonError(res, 404, "Membership not found or access denied");
+      }
+
+      const ajo = (membership as any).ajos;
+      if (!ajo) {
+        return jsonError(res, 404, "Ajo not found");
+      }
+
+      if (ajo.status && ajo.status !== "active") {
+        return jsonError(res, 400, "This Ajo group is not active");
+      }
+
+      const cycle = ajo.current_cycle || 1;
+
+      const { count: alreadyPaidCount, error: alreadyPaidError } = await supabaseAdmin
+        .from("ledger")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", user.id)
+        .eq("membership_id", membership_id)
+        .eq("ajo_id", ajo_id)
+        .eq("type", "contribution")
+        .eq("status", "completed")
+        .contains("metadata", { charge_type: "ajo_contribution", cycle });
+
+      if (alreadyPaidError) {
+        console.error("Failed to check prior contributions:", alreadyPaidError);
+      }
+
+      if (alreadyPaidCount && alreadyPaidCount > 0) {
+        return jsonError(res, 409, "Contribution already paid for this cycle");
+      }
+
+      const amount = ajo.contribution_amount as number;
+      if (!amount || typeof amount !== "number" || amount <= 0) {
+        return jsonError(res, 400, "Invalid contribution amount");
+      }
+
+      const { data: newBalanceRows, error: decrementError } = await supabaseAdmin.rpc("decrement_wallet_balance", {
+        p_user_id: user.id,
+        p_amount: amount,
+      });
+
+      if (decrementError) {
+        const message = decrementError.message?.includes("Insufficient balance")
+          ? "Insufficient wallet balance"
+          : decrementError.message?.includes("Wallet not found")
+          ? "Wallet not found"
+          : "Failed to deduct from wallet";
+
+        if (isProbablyNetworkErrorMessage(decrementError.message)) {
+          const withDetails =
+            process.env.NODE_ENV !== "production"
+              ? `Supabase request failed: ${decrementError.message}`
+              : "Service unavailable";
+          return jsonError(res, 503, withDetails);
+        }
+
+        const withDetails =
+          message === "Failed to deduct from wallet" && process.env.NODE_ENV !== "production"
+            ? `${message}: ${decrementError.message}`
+            : message;
+        return jsonError(res, 400, withDetails);
+      }
+
+      const reference = `ajo_wallet_contrib_${membership_id}_${Date.now()}`;
+
+      const { data: ledgerRow, error: ledgerError } = await supabaseAdmin
+        .from("ledger")
+        .insert({
+          user_id: user.id,
+          ajo_id,
+          membership_id,
+          type: "contribution",
+          amount,
+          status: "completed",
+          description: `Ajo contribution (wallet) - ${ajo.name} (Cycle ${cycle})`,
+          provider_reference: reference,
+          metadata: {
+            charge_type: "ajo_contribution",
+            cycle,
+            source: "wallet",
+          },
+        })
+        .select("id")
+        .single();
+
+      if (ledgerError || !ledgerRow) {
+        console.error("Failed to create ledger entry for wallet contribution:", ledgerError);
+        await supabaseAdmin.rpc("decrement_wallet_balance", {
+          p_user_id: user.id,
+          p_amount: -amount,
+        });
+        return jsonError(res, 500, "Failed to record contribution");
+      }
+
+      const { error: walletTxError } = await supabaseAdmin.from("wallet_transactions").insert({
+        user_id: user.id,
+        type: "debit",
+        amount,
+        description: `Ajo contribution - ${ajo.name} (Cycle ${cycle})`,
+        reference_id: ledgerRow.id,
+      });
+
+      if (walletTxError) {
+        console.error("Failed to create wallet transaction for contribution:", walletTxError);
+      }
+
+      const nextDebitDate = computeNextDebitDateISO(ajo.cycle_type);
+      const { error: membershipUpdateError } = await supabaseAdmin
+        .from("memberships")
+        .update({ next_debit_date: nextDebitDate, retry_count: 0 })
+        .eq("id", membership_id)
+        .eq("user_id", user.id);
+
+      if (membershipUpdateError) {
+        console.error("Failed to update next_debit_date after wallet contribution:", membershipUpdateError);
+      }
+
+      const newBalance =
+        Array.isArray(newBalanceRows) && newBalanceRows.length > 0 ? (newBalanceRows[0] as any).new_balance : null;
+
+      return res.json({
+        success: true,
+        message: "Contribution paid from wallet",
+        data: {
+          reference,
+          amount,
+          new_balance: newBalance,
+        },
+      });
+    } catch (error: any) {
+      console.error("Error in pay-contribution-from-wallet:", error);
       return jsonError(res, 400, error.message ?? "Unknown error");
     }
   });
