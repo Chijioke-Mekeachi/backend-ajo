@@ -1,15 +1,28 @@
-import type { Express, Request, Response } from "express";
+import type { Express, Request as ExpressRequest, Response as ExpressResponse } from "express";
 import { createAdminClient, createUserClient, getAuthToken } from "../lib/supabase.js";
 import { getEnv, getOptionalEnv } from "../lib/env.js";
 import { generateBackupCodes, generateSecret, verifyTOTP } from "../lib/totp.js";
 import { createHmac } from "crypto";
 
-function getAuthHeader(req: Request): string | null {
+function isProbablyNetworkErrorMessage(message: string | undefined): boolean {
+  if (!message) return false;
+  return (
+    message.includes("fetch failed") ||
+    message.includes("ENOTFOUND") ||
+    message.includes("EAI_AGAIN") ||
+    message.includes("ECONNREFUSED") ||
+    message.includes("ECONNRESET") ||
+    message.includes("ETIMEDOUT") ||
+    message.includes("socket hang up")
+  );
+}
+
+function getAuthHeader(req: ExpressRequest): string | null {
   const authHeader = req.header("Authorization") || req.header("authorization");
   return authHeader ?? null;
 }
 
-async function requireUser(req: Request) {
+async function requireUser(req: ExpressRequest) {
   const authHeader = getAuthHeader(req);
   if (!authHeader) {
     throw new Error("No authorization header");
@@ -24,7 +37,7 @@ async function requireUser(req: Request) {
   return { user: data.user, supabaseUser };
 }
 
-function jsonError(res: Response, status: number, message: string, includeSuccess = true) {
+function jsonError(res: ExpressResponse, status: number, message: string, includeSuccess = true) {
   if (includeSuccess) {
     return res.status(status).json({ success: false, error: message });
   }
@@ -37,6 +50,245 @@ async function verifyPaystackSignature(payload: string, signature: string, secre
 }
 
 export function registerFunctionRoutes(app: Express) {
+  app.post("/api/create-group", async (req, res) => {
+    try {
+      const { user } = await requireUser(req);
+
+      const {
+        name,
+        description = null,
+        contribution_amount,
+        cycle_type,
+        start_date,
+        max_members,
+        is_public = false,
+        fee_percentage = 6.25,
+      } = req.body ?? {};
+
+      if (!name || typeof name !== "string") {
+        return jsonError(res, 400, "Group name is required");
+      }
+
+      if (!contribution_amount || typeof contribution_amount !== "number" || contribution_amount <= 0) {
+        return jsonError(res, 400, "Contribution amount is required");
+      }
+
+      if (!cycle_type || typeof cycle_type !== "string") {
+        return jsonError(res, 400, "Cycle type is required");
+      }
+
+      if (!start_date || typeof start_date !== "string") {
+        return jsonError(res, 400, "Start date is required");
+      }
+
+      if (!max_members || typeof max_members !== "number" || max_members < 2) {
+        return jsonError(res, 400, "Max members must be at least 2");
+      }
+
+      const supabaseAdmin = createAdminClient();
+
+      const { data: ajo, error: ajoError } = await supabaseAdmin
+        .from("ajos")
+        .insert({
+          name,
+          description,
+          contribution_amount,
+          cycle_type,
+          start_date,
+          max_members,
+          creator_id: user.id,
+          status: "active",
+          current_cycle: 1,
+          is_public,
+          fee_percentage,
+        })
+        .select()
+        .single();
+
+      if (ajoError || !ajo) {
+        console.error("Error creating group:", ajoError);
+        return jsonError(res, 500, "Failed to create group");
+      }
+
+      const { data: membership, error: membershipError } = await supabaseAdmin
+        .from("memberships")
+        .insert({
+          ajo_id: ajo.id,
+          user_id: user.id,
+          position: 1,
+          is_active: true,
+        })
+        .select("id")
+        .single();
+
+      if (membershipError) {
+        console.error("Error creating membership for group creator:", membershipError);
+        // Best-effort rollback to avoid orphaned groups.
+        await supabaseAdmin.from("ajos").delete().eq("id", ajo.id);
+        return jsonError(res, 500, "Failed to create group membership");
+      }
+
+      return res.json({ success: true, data: { group: ajo, membership_id: membership?.id ?? null } });
+    } catch (error: any) {
+      console.error("Error in create-group:", error);
+      const status = error.message === "Unauthorized" ? 401 : 500;
+      return jsonError(res, status, error.message ?? "Unknown error");
+    }
+  });
+
+  app.post("/api/join-group", async (req, res) => {
+    try {
+      const { user } = await requireUser(req);
+      const { ajo_id } = req.body ?? {};
+
+      if (!ajo_id || typeof ajo_id !== "string") {
+        return jsonError(res, 400, "Group ID is required");
+      }
+
+      const supabaseAdmin = createAdminClient();
+
+      const { data: group, error: groupError } = await supabaseAdmin
+        .from("ajos")
+        .select("id, name, max_members")
+        .eq("id", ajo_id)
+        .single();
+
+      if (groupError || !group) {
+        return jsonError(res, 404, "Group not found");
+      }
+
+      const { count } = await supabaseAdmin
+        .from("memberships")
+        .select("*", { count: "exact", head: true })
+        .eq("ajo_id", ajo_id)
+        .eq("is_active", true);
+
+      if (typeof count === "number" && count >= (group.max_members || 0)) {
+        return jsonError(res, 400, "Group is full");
+      }
+
+      const { data: membership, error: membershipError } = await supabaseAdmin
+        .from("memberships")
+        .insert({
+          ajo_id,
+          user_id: user.id,
+          position: (count || 0) + 1,
+          is_active: true,
+        })
+        .select("id")
+        .single();
+
+      if (membershipError) {
+        // Postgres unique violation
+        if ((membershipError as any).code === "23505") {
+          return jsonError(res, 409, "Already a member");
+        }
+        console.error("Error joining group:", membershipError);
+        return jsonError(res, 500, "Failed to join group");
+      }
+
+      return res.json({ success: true, data: { membership_id: membership?.id ?? null, group } });
+    } catch (error: any) {
+      console.error("Error in join-group:", error);
+      const status = error.message === "Unauthorized" ? 401 : 500;
+      return jsonError(res, status, error.message ?? "Unknown error");
+    }
+  });
+
+  app.post("/api/review-join-request", async (req, res) => {
+    try {
+      const { user } = await requireUser(req);
+      const { request_id, action } = req.body ?? {};
+
+      if (!request_id || typeof request_id !== "string") {
+        return jsonError(res, 400, "Request ID is required");
+      }
+
+      if (action !== "approve" && action !== "reject") {
+        return jsonError(res, 400, "Invalid action");
+      }
+
+      const supabaseAdmin = createAdminClient();
+
+      const { data: request, error: requestError } = await supabaseAdmin
+        .from("join_requests")
+        .select("id, ajo_id, user_id, status")
+        .eq("id", request_id)
+        .single();
+
+      if (requestError || !request) {
+        return jsonError(res, 404, "Join request not found");
+      }
+
+      const { data: group, error: groupError } = await supabaseAdmin
+        .from("ajos")
+        .select("id, name, creator_id, max_members")
+        .eq("id", request.ajo_id)
+        .single();
+
+      if (groupError || !group) {
+        return jsonError(res, 404, "Group not found");
+      }
+
+      if (group.creator_id !== user.id) {
+        return jsonError(res, 403, "Only the group creator can review join requests");
+      }
+
+      if (action === "approve") {
+        const { count } = await supabaseAdmin
+          .from("memberships")
+          .select("*", { count: "exact", head: true })
+          .eq("ajo_id", request.ajo_id)
+          .eq("is_active", true);
+
+        if (typeof count === "number" && count >= (group.max_members || 0)) {
+          return jsonError(res, 400, "Group is full");
+        }
+
+        const { error: membershipError } = await supabaseAdmin.from("memberships").insert({
+          ajo_id: request.ajo_id,
+          user_id: request.user_id,
+          position: (count || 0) + 1,
+          is_active: true,
+        });
+
+        if (membershipError && (membershipError as any).code !== "23505") {
+          console.error("Error approving join request (membership insert):", membershipError);
+          return jsonError(res, 500, "Failed to approve join request");
+        }
+      }
+
+      const nextStatus = action === "approve" ? "approved" : "rejected";
+      const { error: updateError } = await supabaseAdmin
+        .from("join_requests")
+        .update({
+          status: nextStatus,
+          reviewed_at: new Date().toISOString(),
+          reviewed_by: user.id,
+        })
+        .eq("id", request_id);
+
+      if (updateError) {
+        console.error("Error updating join request:", updateError);
+        return jsonError(res, 500, "Failed to update join request");
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          status: nextStatus,
+          group_id: group.id,
+          group_name: group.name,
+          user_id: request.user_id,
+        },
+      });
+    } catch (error: any) {
+      console.error("Error in review-join-request:", error);
+      const status = error.message === "Unauthorized" ? 401 : 500;
+      return jsonError(res, status, error.message ?? "Unknown error");
+    }
+  });
+
   app.post("/api/check-2fa-status", async (req, res) => {
     try {
       const { user_id } = req.body ?? {};
@@ -1162,8 +1414,8 @@ export function registerFunctionRoutes(app: Express) {
     }
   });
 
-  app.post("/api/initiate-transfer", async (req, res) => {
-    try {
+	  app.post("/api/initiate-transfer", async (req, res) => {
+	    try {
       const PAYSTACK_SECRET_KEY = getOptionalEnv("PAYSTACK_SECRET_KEY");
       if (!PAYSTACK_SECRET_KEY) {
         throw new Error("PAYSTACK_SECRET_KEY is not configured");
@@ -1224,52 +1476,96 @@ export function registerFunctionRoutes(app: Express) {
       });
 
       if (decrementError) {
+        console.error("decrement_wallet_balance error:", decrementError);
         const errorMessage = decrementError.message.includes("Insufficient balance")
           ? "Insufficient balance"
           : decrementError.message.includes("Wallet not found")
           ? "Wallet not found"
           : "Failed to process withdrawal";
-        return jsonError(res, 400, errorMessage);
+
+        if (isProbablyNetworkErrorMessage(decrementError.message)) {
+          const withDetails =
+            process.env.NODE_ENV !== "production" ? `Supabase request failed: ${decrementError.message}` : "Service unavailable";
+          return jsonError(res, 503, withDetails);
+        }
+
+        const withDetails =
+          errorMessage === "Failed to process withdrawal" && process.env.NODE_ENV !== "production"
+            ? `${errorMessage}: ${decrementError.message}`
+            : errorMessage;
+        return jsonError(res, 400, withDetails);
       }
 
-      const { error: ledgerError } = await supabaseAdmin.from("ledger").insert({
-        user_id: userData.user.id,
-        type: "withdrawal",
-        amount: -amount,
-        status: "pending",
-        description: `Withdrawal to ${linkedBank.bank_name}`,
-        provider_reference: reference,
-        metadata: {
-          bank_name: linkedBank.bank_name,
-          account_number: linkedBank.account_number,
-        },
-      });
+	      const { data: ledgerRow, error: ledgerError } = await supabaseAdmin
+	        .from("ledger")
+	        .insert({
+	        user_id: userData.user.id,
+	        type: "withdrawal",
+	        amount: -amount,
+	        status: "pending",
+	        description: `Withdrawal to ${linkedBank.bank_name}`,
+	        provider_reference: reference,
+	        metadata: {
+	          bank_name: linkedBank.bank_name,
+	          account_number: linkedBank.account_number,
+	        },
+	        })
+	        .select("id")
+	        .single();
 
-      if (ledgerError) {
+	      if (ledgerError) {
+	        console.error("Failed to create ledger entry for withdrawal:", ledgerError);
+	        await supabaseAdmin.rpc("decrement_wallet_balance", {
+	          p_user_id: userData.user.id,
+	          p_amount: -amount,
+	        });
+	        return jsonError(res, 500, "Failed to process withdrawal");
+	      }
+
+      let paystackResponse: Response;
+      try {
+        paystackResponse = await fetch("https://api.paystack.co/transfer", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            source: "balance",
+            amount,
+            recipient: recipient_code,
+            reason: reason || "Wallet withdrawal",
+            reference,
+          }),
+        });
+      } catch (error: any) {
+        console.error("Paystack transfer request failed:", error);
         await supabaseAdmin.rpc("decrement_wallet_balance", {
           p_user_id: userData.user.id,
           p_amount: -amount,
         });
-        return jsonError(res, 500, "Failed to process withdrawal");
-      }
 
-      const paystackResponse = await fetch("https://api.paystack.co/transfer", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          source: "balance",
-          amount,
-          recipient: recipient_code,
-          reason: reason || "Wallet withdrawal",
-          reference,
-        }),
-      });
+        await supabaseAdmin
+          .from("ledger")
+          .update({
+            status: "failed",
+            metadata: { ...linkedBank, error: String(error?.message || error) },
+          })
+          .eq("provider_reference", reference);
+
+        const message =
+          process.env.NODE_ENV !== "production"
+            ? `Paystack request failed: ${String(error?.message || error)}`
+            : "Withdrawal provider unavailable";
+        return jsonError(res, 502, message);
+      }
 
       const paystackData = await paystackResponse.json();
       if (!paystackData.status) {
+        const paystackMessage = String(paystackData.message || "Transfer initiation failed");
+        const isStarterBusinessRestriction =
+          /starter business/i.test(paystackMessage) && /third party payouts/i.test(paystackMessage);
+
         await supabaseAdmin.rpc("decrement_wallet_balance", {
           p_user_id: userData.user.id,
           p_amount: -amount,
@@ -1280,7 +1576,15 @@ export function registerFunctionRoutes(app: Express) {
           .update({ status: "failed", metadata: { ...linkedBank, error: paystackData.message } })
           .eq("provider_reference", reference);
 
-        return jsonError(res, 400, paystackData.message || "Transfer initiation failed");
+        if (isStarterBusinessRestriction) {
+          return jsonError(
+            res,
+            403,
+            "Paystack transfers are disabled for your business tier (Starter). Upgrade/verify your Paystack business to enable third‑party payouts."
+          );
+        }
+
+        return jsonError(res, 400, paystackMessage);
       }
 
       await supabaseAdmin
@@ -1294,23 +1598,24 @@ export function registerFunctionRoutes(app: Express) {
         })
         .eq("provider_reference", reference);
 
-      await supabaseAdmin.from("wallet_transactions").insert({
-        user_id: userData.user.id,
-        type: "withdrawal",
-        amount: -amount,
-        description: `Withdrawal to ${linkedBank.bank_name} - ${linkedBank.account_number}`,
-      });
+	      await supabaseAdmin.from("wallet_transactions").insert({
+	        user_id: userData.user.id,
+	        type: "debit",
+	        amount,
+	        description: `Withdrawal to ${linkedBank.bank_name} - ${linkedBank.account_number}`,
+	        reference_id: ledgerRow?.id ?? undefined,
+	      });
 
-      return res.json({
-        success: true,
-        reference,
-        transfer_code: paystackData.data.transfer_code,
-      });
-    } catch (error: any) {
-      console.error("Error in initiate-transfer:", error);
-      return jsonError(res, 500, error.message ?? "Unknown error");
-    }
-  });
+	      return res.json({
+	        success: true,
+	        reference,
+	        transfer_code: paystackData.data.transfer_code,
+	      });
+	    } catch (error: any) {
+	      console.error("Error in initiate-transfer:", error);
+	      return jsonError(res, 500, error.message ?? "Unknown error");
+	    }
+	  });
 
   app.post("/api/process-scheduled-contributions", async (req, res) => {
     console.log("Starting scheduled contributions processing...");
